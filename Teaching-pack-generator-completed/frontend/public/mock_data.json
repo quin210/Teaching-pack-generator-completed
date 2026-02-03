@@ -1,0 +1,175 @@
+﻿{
+  "lesson_summary": "Lesson on linear equations in one variable. Students learn how to solve simple equations, move terms, find common denominators, and check solutions. Requires basic arithmetic and logical reasoning.",
+  "skills": [
+    "Read the word problem",
+    "Move terms in an equation",
+    "Basic arithmetic",
+    "Check solutions",
+    "Logical reasoning"
+  ],
+  "groups": [
+    {
+      "id": "A",
+      "focus": "Core reinforcement",
+      "mastery": "Low",
+      "missing_skills": "Problem reading, moving terms",
+      "rationale": "This group needs many concrete examples and step-by-step guidance. Focus on understanding the meaning of an equation.",
+      "pack": {
+        "slides": [
+          {
+            "title": "What is an equation?",
+            "content": "Introduce the concept of equations with real-life examples: balance, finding an unknown number. Use simple visuals and examples."
+          },
+          {
+            "title": "How to move terms",
+            "content": "Explain the rule for moving terms with multiple examples. Emphasize changing the sign when moving across the equals sign."
+          },
+          {
+            "title": "Worked examples",
+            "content": "3-4 problems from simple to more complex, each step explained clearly."
+          }
+        ],
+        "quiz": [
+          {
+            "question": "The solution of x + 5 = 8 is?",
+            "options": ["x = 3", "x = 13", "x = -3", "x = 5"],
+            "correct": 0,
+            "hint": "Move 5 to the right-hand side and change the sign"
+          },
+          {
+            "question": "When moving a term across the equals sign, we should?",
+            "options": ["Keep the sign", "Change the sign", "Multiply by 2", "Divide by 2"],
+            "correct": 1
+          }
+        ],
+        "practice": [
+          {
+            "problem": "Solve: x - 3 = 7",
+            "hint": "Move -3 to the right, change to +3"
+          },
+          {
+            "problem": "Solve: 2x = 10",
+            "hint": "Divide both sides by 2"
+          },
+          {
+            "problem": "Solve: x + 4 = 12",
+            "hint": "Move 4 to the right"
+          }
+        ],
+        "verification": {
+          "quiz_valid": true,
+          "alignment": true,
+          "curriculum": true
+        }
+      }
+    },
+    {
+      "id": "B",
+      "focus": "Standard practice",
+      "mastery": "Medium",
+      "missing_skills": "Complex arithmetic",
+      "rationale": "This group has the basics but needs more varied practice to improve speed and accuracy.",
+      "pack": {
+        "slides": [
+          {
+            "title": "Quick review",
+            "content": "Summarize the basic steps for solving linear equations. Review moving terms and common denominators."
+          },
+          {
+            "title": "Equations with fractions",
+            "content": "How to find common denominators and simplify. Tips for faster calculations."
+          },
+          {
+            "title": "More complex equations",
+            "content": "Equations with parentheses, fractions, and terms on both sides."
+          }
+        ],
+        "quiz": [
+          {
+            "question": "Solve: 2x + 3 = 11",
+            "options": ["x = 4", "x = 7", "x = 5", "x = 8"],
+            "correct": 0
+          },
+          {
+            "question": "The solution of 3(x-1) = 9 is?",
+            "options": ["x = 2", "x = 3", "x = 4", "x = 5"],
+            "correct": 2
+          }
+        ],
+        "practice": [
+          {
+            "problem": "Solve: 3x - 5 = 10",
+            "hint": "Move -5 then divide by 3"
+          },
+          {
+            "problem": "Solve: (x+2)/3 = 4",
+            "hint": "Multiply both sides by 3"
+          },
+          {
+            "problem": "Solve: 2(x-1) + 3 = 11",
+            "hint": "Expand first"
+          }
+        ],
+        "verification": {
+          "quiz_valid": true,
+          "alignment": true,
+          "curriculum": true
+        }
+      }
+    },
+    {
+      "id": "C",
+      "focus": "Advanced and extension",
+      "mastery": "High",
+      "missing_skills": "—",
+      "rationale": "This group is strong on the basics and can explore advanced forms and real-world applications.",
+      "pack": {
+        "slides": [
+          {
+            "title": "Equations with absolute value",
+            "content": "Introduce absolute value and how to solve equations that include it."
+          },
+          {
+            "title": "Equations with parameters",
+            "content": "Solve equations with a parameter. Discuss special cases."
+          },
+          {
+            "title": "Real-world applications",
+            "content": "Applications in motion, mixture problems, and everyday contexts."
+          }
+        ],
+        "quiz": [
+          {
+            "question": "Solve: |x - 2| = 3",
+            "options": ["x = 5 or x = -1", "x = 5", "x = -1", "x = 1"],
+            "correct": 0
+          },
+          {
+            "question": "The equation mx = 6 has no solution when?",
+            "options": ["m = 0", "m = 6", "m = 1", "m ≠ 0"],
+            "correct": 0
+          }
+        ],
+        "practice": [
+          {
+            "problem": "Solve: |2x - 1| = 5",
+            "hint": "Consider 2x-1=5 and 2x-1=-5"
+          },
+          {
+            "problem": "Solve: (m-2)x = 4 in terms of m",
+            "hint": "Consider m=2 and m≠2"
+          },
+          {
+            "problem": "A car travels from A to B at speed x km/h for 3 hours. AB = 150 km. Find x.",
+            "hint": "Use: speed × time = distance"
+          }
+        ],
+        "verification": {
+          "quiz_valid": true,
+          "alignment": true,
+          "curriculum": true
+        }
+      }
+    }
+  ]
+}

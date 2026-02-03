@@ -1,0 +1,15 @@
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+outputs
+pgdata
+dist
+build
+*.log
+.DS_Store
+.env

@@ -1,0 +1,23 @@
+seed: 42
+
+paths:
+  output_dir: results/experiments
+
+evaluation:
+  num_groups: 3
+  num_students: 30
+
+models:
+  mas:
+    pipeline: gemini-2.5-flash
+    evaluator: gemini-2.5-flash
+  single_agent:
+    pipeline: gemini-2.0-flash
+    evaluator: gemini-2.5-flash
+  vllm:
+    base_url: http://localhost:8000/v1
+    model: Qwen/Qwen3-4B
+    lora: null
+    api_key: null
+  hf:
+    model: Qwen/Qwen3-4B-Instruct-2507

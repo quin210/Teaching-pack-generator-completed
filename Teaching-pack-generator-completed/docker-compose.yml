@@ -1,0 +1,131 @@
+# services:
+#   redis:
+#     image: redis:7-alpine
+#     ports:
+#       - "6379:6379"
+#
+#   db:
+#     image: postgres:16-alpine
+#     environment:
+#       POSTGRES_DB: teachingpack
+#       POSTGRES_USER: postgres
+#       POSTGRES_PASSWORD: postgres
+#     ports:
+#       - "5432:5432"
+#     volumes:
+#       - pgdata:/var/lib/postgresql/data
+#
+#   api:
+#     build: .
+#     env_file: .env
+#     environment:
+#       PORT: 8000
+#     ports:
+#       - "8000:8000"
+#     depends_on:
+#       - redis
+#       - db
+#     volumes:
+#       - ./outputs:/app/outputs
+#       - ./src:/app/src
+#     command: >
+#       sh -c "gunicorn -k uvicorn.workers.UvicornWorker api.main:app
+#       --bind 0.0.0.0:${PORT:-8000}
+#       --workers 1
+#       --timeout 120"
+#
+#   worker:
+#     build: .
+#     env_file: .env
+#     depends_on:
+#       - redis
+#       - db
+#     volumes:
+#       - ./outputs:/app/outputs
+#       - ./src:/app/src
+#     command: >
+#       sh -c "rq worker -u $REDIS_URL teachingpack"
+#
+# volumes:
+#   pgdata:
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: teachingpack
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d teachingpack"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      PORT: 8000
+
+      # Fix ProxyHeadersMiddleware / forwarded_allow_ips if needed in production
+      # PROXY_HEADERS: "0"
+      # FORWARDED_ALLOW_IPS: ""
+
+      # Ensure worker and API use the internal Docker Redis
+      REDIS_URL: "redis://redis:6379/0"
+
+      # If your DB URL already points to db:5432 keep it; otherwise set it here
+      DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/teachingpack"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    volumes:
+      - ./outputs:/app/outputs
+      - ./src:/app/src
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker api.main:app
+      --bind 0.0.0.0:${PORT:-8000}
+      --workers 1
+      --timeout 120
+      --access-logfile -
+      --error-logfile -
+      --log-level info"
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      # Worker also needs the internal Redis and DB
+      REDIS_URL: "redis://redis:6379/0"
+      DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/teachingpack"
+
+      # Disable proxy headers if needed (no effect locally)
+      # PROXY_HEADERS: "0"
+      # FORWARDED_ALLOW_IPS: ""
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

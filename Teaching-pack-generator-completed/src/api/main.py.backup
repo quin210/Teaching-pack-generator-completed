@@ -1,0 +1,1904 @@
+"""
+FastAPI application for Teaching Pack Generator
+Multi-agent system for automatic teaching pack generation with differentiated instruction.
+"""
+import os
+from dotenv import load_dotenv
+
+# Load env vars immediately
+load_dotenv()
+
+import uuid
+import asyncio
+import requests
+from typing import List, Dict, Optional
+from datetime import timedelta
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Form
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.providers.google import GoogleProvider
+from loguru import logger
+import uuid
+from pathlib import Path
+import json
+
+# Import authentication
+from api.auth import (
+    authenticate_user, create_access_token, get_current_active_user,
+    Token, LoginRequest, UserResponse, login_for_access_token, register_user,
+    ACCESS_TOKEN_EXPIRE_MINUTES, UserRole
+)
+
+# Import database models
+from models.database_models import User, Lesson, TeachingPack
+
+# Import database
+from models.database import get_db, create_tables
+from models.database_service import (
+    get_classrooms_by_teacher, create_classroom, get_students_by_classroom,
+    create_student, create_lesson, get_lessons_by_classroom, create_teaching_pack,
+    update_teaching_pack_status, update_classroom, delete_classroom, get_classroom_by_id,
+    get_student_by_id, update_student, delete_student
+)
+
+# Import AgentClient
+from llm.base import AgentClient
+
+# Import prompts
+from data.prompts.teaching_pack_prompts import (
+    LESSON_PARSER_PROMPT, SKILL_MAPPER_PROMPT, DIAGNOSTIC_BUILDER_PROMPT,
+    GROUP_LABELER_PROMPT, PACK_PLANNER_PROMPT, SLIDE_AUTHOR_PROMPT,
+    QUIZ_PRACTICE_PROMPT, VIDEO_GENERATOR_PROMPT, SLIDE_DRAFTER_PROMPT, VIDEO_DRAFTER_PROMPT
+)
+
+# Import models
+from models.teaching_pack_models import (
+    LessonSummary, SkillSet, Diagnostic, GroupProfile,
+    PackPlan, Slides, Video, Quiz
+)
+
+# Import helpers
+from utils.workflow_helpers import (
+    load_lesson_content, load_student_list, generate_mock_diagnostic_results,
+    export_diagnostic_results, format_diagnostic_questions,
+    parse_student_list_with_scores
+)
+
+# Import tools
+from utils.basetools.grouping_utils import profile_groups_by_quartile
+from utils.basetools.heterogeneous_grouping import heterogeneous_grouping_by_subject, ai_grouping_by_subject
+from utils.basetools.slide_tools import generate_slides_from_text, search_themes
+from utils.basetools.video_tools import generate_video_from_prompt
+from utils.basetools.pdf_parser import extract_text_from_pdf
+
+
+# ============= FASTAPI APP SETUP =============
+app = FastAPI(
+    title="Teaching Pack Generator API",
+    description="Multi-agent system for automatic teaching pack generation with differentiated instruction",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    create_tables()
+    logger.info("Database tables created/verified")
+
+# ============= MODEL CONFIGURATION =============
+provider = GoogleProvider(api_key=os.getenv("GEMINI_API_KEY"))
+model = GoogleModel('gemini-2.0-flash', provider=provider)
+
+# AGENTS INITIALIZATION =============
+lesson_parser_agent = AgentClient(model=model, system_prompt=LESSON_PARSER_PROMPT, tools=[extract_text_from_pdf]).create_agent(result_type=LessonSummary)
+skill_mapper_agent = AgentClient(model=model, system_prompt=SKILL_MAPPER_PROMPT, tools=[]).create_agent(result_type=SkillSet)
+diagnostic_builder_agent = AgentClient(model=model, system_prompt=DIAGNOSTIC_BUILDER_PROMPT, tools=[]).create_agent(result_type=Diagnostic)
+group_labeler_agent = AgentClient(model=model, system_prompt=GROUP_LABELER_PROMPT, tools=[]).create_agent(result_type=GroupProfile)
+pack_planner_agent = AgentClient(model=model, system_prompt=PACK_PLANNER_PROMPT, tools=[]).create_agent(result_type=PackPlan)
+slide_drafter_agent = AgentClient(model=model, system_prompt=SLIDE_DRAFTER_PROMPT, tools=[search_themes]).create_agent(result_type=Slides)
+quiz_practice_agent = AgentClient(model=model, system_prompt=QUIZ_PRACTICE_PROMPT, tools=[]).create_agent(result_type=Quiz)
+video_drafter_agent = AgentClient(model=model, system_prompt=VIDEO_DRAFTER_PROMPT, tools=[]).create_agent()
+
+# ============= STORAGE FOR ASYNC JOBS =============
+jobs_storage = {}
+OUTPUT_DIR = Path("outputs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# ============= AUTHENTICATION ENDPOINTS =============
+
+@app.post("/api/auth/login", response_model=Token)
+async def login(login_data: LoginRequest, db = Depends(get_db)):
+    """Login endpoint"""
+    return login_for_access_token(db, login_data)
+
+@app.post("/api/auth/register", response_model=UserResponse)
+async def register(email: str, password: str, full_name: str, role: UserRole = UserRole.TEACHER, db = Depends(get_db)):
+    """Register a new user"""
+    user = register_user(db, email, password, full_name, role)
+    return UserResponse(
+        id=user.id,  # type: ignore
+        email=user.email,  # type: ignore
+        full_name=user.full_name,  # type: ignore
+        role=user.role.value,  # type: ignore
+        is_active=user.is_active  # type: ignore
+    )
+
+@app.get("/api/auth/me", response_model=UserResponse)
+async def get_current_user_info(current_user = Depends(get_current_active_user)):
+    """Get current user information"""
+    return UserResponse(
+        id=current_user.id,  # type: ignore
+        email=current_user.email,  # type: ignore
+        full_name=current_user.full_name,  # type: ignore
+        role=current_user.role.value,  # type: ignore
+        is_active=current_user.is_active  # type: ignore
+    )
+
+# ============= CLASSROOM MANAGEMENT ENDPOINTS =============
+
+@app.get("/api/classrooms")
+async def get_classrooms(current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Get all classrooms for the current teacher"""
+    classrooms = get_classrooms_by_teacher(db, current_user.id)
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "grade": c.grade,
+            "subject": c.subject,
+            "student_count": c.student_count,
+            "created_at": c.created_at
+        }
+        for c in classrooms
+    ]
+
+@app.post("/api/classrooms")
+async def create_new_classroom(name: str = Form(...), grade: str = Form(...), subject: str = Form(...), student_count: int = Form(...),
+                              current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Create a new classroom"""
+    classroom = create_classroom(db, name, grade, subject, student_count, current_user.id)
+    return {
+        "id": classroom.id,
+        "name": classroom.name,
+        "grade": classroom.grade,
+        "subject": classroom.subject,
+        "student_count": classroom.student_count,
+        "created_at": classroom.created_at
+    }
+
+@app.put("/api/classrooms/{classroom_id}")
+async def update_classroom_endpoint(classroom_id: int, name: str = Form(None), grade: str = Form(None), 
+                                   subject: str = Form(None), student_count: int = Form(None),
+                                   current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Update a classroom"""
+    # Check if classroom belongs to current user
+    classroom = get_classroom_by_id(db, classroom_id)
+    if not classroom or classroom.teacher_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Classroom not found")
+    
+    updated_classroom = update_classroom(db, classroom_id, name, grade, subject, student_count)
+    if not updated_classroom:
+        raise HTTPException(status_code=404, detail="Classroom not found")
+    
+    return {
+        "id": updated_classroom.id,
+        "name": updated_classroom.name,
+        "grade": updated_classroom.grade,
+        "subject": updated_classroom.subject,
+        "student_count": updated_classroom.student_count,
+        "created_at": updated_classroom.created_at
+    }
+
+@app.delete("/api/classrooms/{classroom_id}")
+async def delete_classroom_endpoint(classroom_id: int, current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Delete a classroom"""
+    # Check if classroom belongs to current user
+    classroom = get_classroom_by_id(db, classroom_id)
+    if not classroom or classroom.teacher_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Classroom not found")
+    
+    success = delete_classroom(db, classroom_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Classroom not found")
+    
+    return {"message": "Classroom deleted successfully"}
+
+@app.get("/api/classrooms/{classroom_id}/students")
+async def get_classroom_students(classroom_id: int, current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Get all students in a classroom"""
+    students = get_students_by_classroom(db, classroom_id)
+    return [
+        {
+            "id": s.id,
+            "student_id": s.student_id,
+            "full_name": s.full_name,
+            "email": s.email,
+            "created_at": s.created_at
+        }
+        for s in students
+    ]
+
+@app.post("/api/classrooms/{classroom_id}/students")
+async def add_student_to_classroom(classroom_id: int, student_id: str = Form(...), full_name: str = Form(...), email: str = Form(...),
+                                  current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Add a student to a classroom"""
+    student = create_student(db, student_id, full_name, email, classroom_id)
+    return {
+        "id": student.id,
+        "student_id": student.student_id,
+        "full_name": student.full_name,
+        "email": student.email,
+        "created_at": student.created_at
+    }
+
+@app.put("/api/students/{student_id}")
+async def update_student_endpoint(student_id: int, student_code: str = Form(None), full_name: str = Form(None), 
+                                 email: str = Form(None), current_user = Depends(get_current_active_user), 
+                                 db = Depends(get_db)):
+    """Update a student"""
+    # Check if student belongs to current user's classroom
+    student = get_student_by_id(db, student_id)
+    if not student or not student.classroom or student.classroom.teacher_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    updated_student = update_student(db, student_id, student_code, full_name, email)
+    if not updated_student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    return {
+        "id": updated_student.id,
+        "student_id": updated_student.student_id,
+        "full_name": updated_student.full_name,
+        "email": updated_student.email,
+        "created_at": updated_student.created_at
+    }
+
+@app.delete("/api/students/{student_id}")
+async def delete_student_endpoint(student_id: int, current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Delete a student"""
+    # Check if student belongs to current user's classroom
+    student = get_student_by_id(db, student_id)
+    if not student or not student.classroom or student.classroom.teacher_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    success = delete_student(db, student_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    return {"message": "Student deleted successfully"}
+
+# ============= STUDENT LIST & GROUPING ENDPOINTS =============
+
+@app.post("/api/classrooms/{classroom_id}/upload-students-and-group")
+async def upload_students_and_create_groups(
+    classroom_id: int,
+    student_list_file: UploadFile = File(...),
+    num_groups: int = Form(4),
+    current_user: User = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    """
+    API 1: Upload student list with scores and create heterogeneous groups
+    
+    - **student_list_file**: Excel/CSV file with columns: Name, Toan, Van, Anh, etc.
+    - **num_groups**: Number of groups to create (default: 4)
+    
+    Returns: Group configuration and saves to classroom
+    
+    This creates smart groups where weak students in a subject are paired with
+    strong students for peer learning.
+    """
+    try:
+        # Validate classroom ownership
+        classroom = get_classroom_by_id(db, classroom_id)
+        if not classroom or classroom.teacher_id != current_user.id:  # type: ignore
+            raise HTTPException(status_code=404, detail="Classroom not found")
+        
+        # Save uploaded file
+        upload_id = str(uuid.uuid4())
+        upload_dir = OUTPUT_DIR / "uploads" / upload_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        file_path = upload_dir / student_list_file.filename  # type: ignore
+        
+        await save_upload_file(student_list_file, file_path)
+        logger.info(f"Student list file saved: {file_path}")
+        
+        # Parse student list with scores
+        students_data = parse_student_list_with_scores(str(file_path))
+        
+        if not students_data:
+            raise HTTPException(status_code=400, detail="No students found in file")
+        
+        logger.info(f"Parsed {len(students_data)} students with scores")
+        
+        # Use AI agent for intelligent heterogeneous grouping based on classroom subject
+        subject = classroom.subject  # type: ignore
+        logger.info(f"Using AI Grouping Agent for subject '{subject}'")
+        
+        # AI agent returns complete groups_configuration with profiles
+        groups_configuration = await ai_grouping_by_subject(students_data, subject, num_groups)  # type: ignore
+        
+        # Save or update students in database
+        from models.database_models import Student
+        
+        # Clear existing students in classroom
+        db.query(Student).filter(Student.classroom_id == classroom_id).delete()
+        
+        # Add new students with their group assignments
+        # groups_configuration structure: {group_id: {group_id, students: [ids], profile: {...}}}
+        student_id_to_data = {s['student_id']: s for s in students_data}
+        
+        for group_id, group_info in groups_configuration.items():
+            student_ids = group_info['students']
+            for student_id in student_ids:
+                if student_id in student_id_to_data:
+                    student_data = student_id_to_data[student_id]
+                    new_student = Student(
+                        student_id=student_data["student_id"],
+                        full_name=student_data["full_name"],
+                        email=student_data.get("email", f"{student_data['student_id']}_{classroom_id}@example.com"),
+                        classroom_id=classroom_id,
+                        subject_scores=student_data.get("subject_scores", {}),
+                        grade_level=student_data.get("grade_level"),
+                        notes=student_data.get("notes"),
+                        group_id=group_id
+                    )
+                    db.add(new_student)
+        
+        # Save groups configuration to classroom
+        classroom.groups_configuration = groups_configuration  # type: ignore
+        classroom.student_count = len(students_data)  # type: ignore
+        
+        db.commit()
+        db.refresh(classroom)
+        
+        logger.info(f"Successfully created {num_groups} groups for classroom {classroom_id}")
+        
+        return {
+            "message": f"Successfully uploaded {len(students_data)} students and created {num_groups} groups",
+            "num_students": len(students_data),
+            "num_groups": num_groups,
+            "groups": groups_configuration,
+            "classroom": {
+                "id": classroom.id,
+                "name": classroom.name,
+                "subject": classroom.subject,
+                "grade": classroom.grade
+            }
+        }
+        
+    except ValueError as ve:
+        logger.error(f"Validation error: {str(ve)}")
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error uploading students and creating groups: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/classrooms/{classroom_id}/create-groups")
+async def create_groups_from_existing_students(
+    classroom_id: int,
+    num_groups: int = 4,
+    current_user: User = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    """
+    API: Create groups from existing students in classroom
+    
+    - **num_groups**: Number of groups to create (default: 4)
+    
+    Returns: Group configuration and updates classroom
+    
+    This creates smart groups where weak students in a subject are paired with
+    strong students for peer learning, using existing student data.
+    """
+    try:
+        # Validate classroom ownership
+        classroom = get_classroom_by_id(db, classroom_id)
+        if not classroom or classroom.teacher_id != current_user.id:  # type: ignore
+            raise HTTPException(status_code=404, detail="Classroom not found")
+        
+        # Get existing students
+        students = get_students_by_classroom(db, classroom_id)
+        if not students:
+            raise HTTPException(status_code=400, detail="No students found in classroom")
+        
+        # Convert to format expected by grouping function
+        students_data = []
+        for student in students:
+            students_data.append({
+                "student_id": student.student_id,
+                "full_name": student.full_name,
+                "email": student.email,
+                "subject_scores": student.subject_scores or {},
+                "grade_level": student.grade_level,
+                "notes": student.notes
+            })
+        
+        logger.info(f"Found {len(students_data)} existing students in classroom {classroom_id}")
+        
+        # Use AI agent for intelligent heterogeneous grouping based on classroom subject
+        subject = classroom.subject  # type: ignore
+        logger.info(f"Using AI Grouping Agent for subject '{subject}'")
+        
+        # AI agent returns complete groups_configuration with profiles
+        groups_configuration = await ai_grouping_by_subject(students_data, subject, num_groups)  # type: ignore
+        
+        # Update students with their group assignments
+        from models.database_models import Student
+        
+        for group_id, group_info in groups_configuration.items():
+            student_ids = group_info['students']
+            for student_id in student_ids:
+                # Find student in database and update group_id
+                student = db.query(Student).filter(
+                    Student.student_id == student_id,
+                    Student.classroom_id == classroom_id
+                ).first()
+                if student:
+                    student.group_id = group_id
+        
+        # Save groups configuration to classroom
+        classroom.groups_configuration = groups_configuration  # type: ignore
+        
+        db.commit()
+        db.refresh(classroom)
+        
+        logger.info(f"Successfully created {num_groups} groups for classroom {classroom_id}")
+        
+        return {
+            "message": f"Successfully created {num_groups} groups from {len(students_data)} existing students",
+            "num_students": len(students_data),
+            "num_groups": num_groups,
+            "groups": groups_configuration,
+            "classroom": {
+                "id": classroom.id,
+                "name": classroom.name,
+                "subject": classroom.subject,
+                "grade": classroom.grade
+            }
+        }
+        
+    except ValueError as ve:
+        logger.error(f"Validation error: {str(ve)}")
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error creating groups from existing students: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/api/classrooms/{classroom_id}/groups")
+async def get_classroom_groups(
+    classroom_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    """Get groups configuration for a classroom"""
+    from models.database_models import TeachingPack
+    
+    logger.info(f"=== Getting groups for classroom {classroom_id} ===")
+    
+    classroom = get_classroom_by_id(db, classroom_id)
+    if not classroom or classroom.teacher_id != current_user.id:  # type: ignore
+        raise HTTPException(status_code=404, detail="Classroom not found")
+    
+    if not classroom.groups_configuration:  # type: ignore
+        logger.info("No groups configured yet")
+        return {
+            "message": "No groups configured yet",
+            "groups": {}
+        }
+    
+    # Get the groups configuration
+    groups_config = classroom.groups_configuration  # type: ignore
+    logger.info(f"Groups config keys: {list(groups_config.keys()) if isinstance(groups_config, dict) else 'not a dict'}")
+    
+    # Enhance groups with data from TeachingPack table
+    teaching_packs = db.query(TeachingPack).filter(
+        TeachingPack.classroom_id == classroom_id
+    ).all()
+    
+    logger.info(f"Found {len(teaching_packs)} teaching packs in database")
+    
+    # Create a map of pack data by group id/focus
+    pack_data_map = {}
+    for tp in teaching_packs:
+        logger.info(f"TeachingPack ID={tp.id}, has_data={tp.teaching_pack_data is not None}")
+        if tp.teaching_pack_data:
+            pack_data = tp.teaching_pack_data
+            logger.info(f"  Pack data keys: {list(pack_data.keys()) if isinstance(pack_data, dict) else 'not a dict'}")
+            logger.info(f"  Pack data sample: {str(pack_data)[:500]}")  # First 500 chars
+            # Try to match by group_id or focus (check nested structure)
+            group_key = None
+            if "group" in pack_data and isinstance(pack_data["group"], dict):
+                group_key = pack_data["group"].get("group_id")
+            if not group_key:
+                group_key = pack_data.get("group_id") or pack_data.get("focus")
+            logger.info(f"  Pack group_key: {group_key}")
+            logger.info(f"  Pack slides_url: {pack_data.get('slides_url')}")
+            logger.info(f"  Pack video_url: {pack_data.get('video_url')}")
+            if group_key:
+                pack_data_map[str(group_key)] = pack_data
+    
+    logger.info(f"Pack data map keys: {list(pack_data_map.keys())}")
+    
+    # Merge pack data into groups configuration
+    if isinstance(groups_config, dict):
+        for group_key, group_data in groups_config.items():
+            logger.info(f"Processing group key: {group_key}")
+            if group_key in pack_data_map:
+                logger.info(f"  Found matching pack data for group {group_key}")
+                pack_data = pack_data_map[group_key]
+                # Create or update 'pack' field with all pack data
+                group_data["pack"] = {
+                    "pack_plan": pack_data.get("pack_plan"),
+                    "slides": pack_data.get("slides"),
+                    "video": pack_data.get("video"),
+                    "quiz": pack_data.get("quiz"),
+                    "slides_url": pack_data.get("slides_url"),
+                    "video_url": pack_data.get("video_url"),
+                    "video_thumbnail": pack_data.get("video_thumbnail"),
+                    "teaching_pack_id": pack_data.get("teaching_pack_id"),
+                    "errors": pack_data.get("errors", [])
+                }
+                logger.info(f"  Merged pack data - slides_url: {group_data['pack'].get('slides_url')}, video_url: {group_data['pack'].get('video_url')}")
+            else:
+                logger.info(f"  No pack data found for group {group_key}")
+                # Create empty pack field
+                group_data["pack"] = None
+    
+    logger.info("=== Finished merging group data ===")
+    
+    return {
+        "classroom_id": classroom_id,
+        "num_groups": len(groups_config),
+        "groups": groups_config
+    }
+
+# ============= LESSON MANAGEMENT ENDPOINTS =============
+
+@app.get("/api/lessons")
+async def get_user_lessons(current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Get all lessons uploaded by the current user"""
+    lessons = db.query(Lesson).filter(Lesson.uploaded_by_id == current_user.id).all()  # type: ignore
+    return [
+        {
+            "id": l.id,
+            "title": l.title,
+            "subject": l.subject,
+            "grade": l.grade,
+            "original_filename": l.original_filename,
+            "file_size": l.file_size,
+            "created_at": l.created_at,
+            "classroom": {
+                "id": l.classroom.id,
+                "name": l.classroom.name
+            } if l.classroom else None
+        }
+        for l in lessons
+    ]
+
+@app.get("/api/classrooms/{classroom_id}/lessons")
+async def get_classroom_lessons(classroom_id: int, current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Get all lessons in a classroom"""
+    lessons = get_lessons_by_classroom(db, classroom_id)
+    return [
+        {
+            "id": l.id,
+            "title": l.title,
+            "subject": l.subject,
+            "grade": l.grade,
+            "original_filename": l.original_filename,
+            "file_size": l.file_size,
+            "created_at": l.created_at,
+            "uploaded_by": {
+                "id": l.uploaded_by.id,
+                "full_name": l.uploaded_by.full_name,
+                "email": l.uploaded_by.email
+            } if l.uploaded_by else None
+        }
+        for l in lessons
+    ]
+
+# ============= TEACHING PACK MANAGEMENT ENDPOINTS =============
+
+
+# ============= REQUEST/RESPONSE MODELS =============
+class JobStatus(BaseModel):
+    job_id: str
+    status: str  # pending, processing, completed, failed
+    message: Optional[str] = None
+    result: Optional[Dict] = None
+    error: Optional[str] = None
+
+
+class GeneratePackRequest(BaseModel):
+    num_groups: int = 4
+    num_students: int = 30
+
+
+class GenerateAssetsRequest(BaseModel):
+    slides_content: Optional[Dict] = None
+    video_content: Optional[Dict] = None
+    generate_video: bool = False
+    generate_slides: bool = True
+
+class GenerateDraftRequest(BaseModel):
+    type: str  # 'slides' or 'video'
+
+
+class LessonParseResponse(BaseModel):
+    lesson_summary: LessonSummary
+    job_id: str
+
+
+class SkillMapResponse(BaseModel):
+    skill_set: SkillSet
+    job_id: str
+
+
+class DiagnosticResponse(BaseModel):
+    diagnostic: Diagnostic
+    job_id: str
+
+@app.get("/api/teaching-packs")
+async def get_user_teaching_packs(current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Get all teaching packs created by the current user"""
+    from models.database_models import TeachingPack
+    teaching_packs = db.query(TeachingPack).filter(TeachingPack.created_by_id == current_user.id).all()
+    return [
+        {
+            "id": tp.id,
+            "title": tp.title,
+            "status": tp.status,
+            "created_at": tp.created_at,
+            "completed_at": tp.completed_at,
+            "lesson_summary": tp.teaching_pack_data.get("lesson_summary") if tp.teaching_pack_data else None,
+            "skill_set": tp.teaching_pack_data.get("skill_set") if tp.teaching_pack_data else None,
+            "diagnostic": tp.teaching_pack_data.get("diagnostic") if tp.teaching_pack_data else None,
+            "groups": tp.teaching_pack_data.get("groups") if tp.teaching_pack_data else None,
+            "teaching_pack_data": tp.teaching_pack_data,
+            "classroom": {
+                "id": tp.classroom.id,
+                "name": tp.classroom.name
+            } if tp.classroom else None,
+            "lesson": {
+                "id": tp.lesson.id,
+                "title": tp.lesson.title
+            } if tp.lesson else None
+        }
+        for tp in teaching_packs
+    ]
+
+@app.get("/api/classrooms/{classroom_id}/teaching-packs")
+async def get_classroom_teaching_packs(classroom_id: int, current_user = Depends(get_current_active_user), db = Depends(get_db)):
+    """Get all teaching packs for a specific classroom"""
+    from models.database_models import TeachingPack
+    # Check if classroom belongs to current user
+    classroom = get_classroom_by_id(db, classroom_id)
+    if not classroom or classroom.teacher_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Classroom not found")
+    
+    teaching_packs = db.query(TeachingPack).filter(TeachingPack.classroom_id == classroom_id).all()
+    return [
+        {
+            "id": tp.id,
+            "title": tp.title,
+            "status": tp.status,
+            "created_at": tp.created_at,
+            "completed_at": tp.completed_at,
+            "lesson_summary": tp.teaching_pack_data.get("lesson_summary") if tp.teaching_pack_data else None,
+            "skill_set": tp.teaching_pack_data.get("skill_set") if tp.teaching_pack_data else None,
+            "diagnostic": tp.teaching_pack_data.get("diagnostic") if tp.teaching_pack_data else None,
+            "groups": tp.teaching_pack_data.get("groups") if tp.teaching_pack_data else None,
+            "teaching_pack_data": tp.teaching_pack_data,
+            "lesson": {
+                "id": tp.lesson.id,
+                "title": tp.lesson.title
+            } if tp.lesson else None
+        }
+        for tp in teaching_packs
+    ]
+
+class CommitPackRequest(BaseModel):
+    job_id: str
+    group_id: str
+    
+@app.post("/api/teaching-packs/commit")
+async def commit_teaching_pack(
+    request: CommitPackRequest,
+    current_user = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    """
+    Commit a teaching pack from Preview stage (JSON) to Database.
+    Returns the new teaching_pack_id.
+    """
+    try:
+        from models.database_models import WorkflowJob
+        
+        # FIX: Load data from DB (WorkflowJob) instead of parsing file
+        job_record = db.query(WorkflowJob).filter(WorkflowJob.id == request.job_id).first()
+        
+        if not job_record:
+             # Try fallback to memory (just in case of immediate access before DB sync - likely unnecessary but safe)
+             if request.job_id in jobs_storage and jobs_storage[request.job_id].get("result"):
+                 full_data = jobs_storage[request.job_id]["result"]
+             else:
+                 raise HTTPException(status_code=404, detail="Job data not found or expired. Please regenerate.")
+        else:
+             full_data = job_record.result_json
+
+        if not full_data:
+             raise HTTPException(status_code=404, detail="Job data is empty")
+             
+        # Find the group
+        target_pack = None
+        target_index = -1
+        
+        # Parse index from group_id if it follows "group-{N}" pattern
+        target_index_from_id = -1
+        if isinstance(request.group_id, str) and request.group_id.startswith("group-"):
+            try:
+                target_index_from_id = int(request.group_id.split("-")[1])
+            except ValueError:
+                pass
+        
+        for idx, pack in enumerate(full_data.get("teaching_packs", [])):
+            # Check by group_id inside group object OR by index
+            if (pack.get("group", {}).get("group_id") == request.group_id) or (idx == target_index_from_id):
+                target_pack = pack
+                target_index = idx
+                break
+        
+        if not target_pack:
+            raise HTTPException(status_code=404, detail=f"Group {request.group_id} not found in results")
+            
+        # Check if already committed
+        if target_pack.get("teaching_pack_id"):
+             return {"teaching_pack_id": target_pack.get("teaching_pack_id"), "status": "already_committed"}
+
+        # Extract data for DB
+        lesson_id = 999 # Need to find the lesson ID. It is not currently stored in teaching_pack objects in JSON.
+        # But we can find it from associated records or stored in the root of JSON if we added it?
+        # Quick fix: Pass it from frontend or look up most recent lesson uploaded by user?
+        # Correct way: Store lesson_id in the output JSON root.
+        
+        # Let's verify if lesson_id matches. The `LessonSummary` doesn't have ID.
+        # We need to find the Lesson created in Stage 1.
+        # The `process_full_workflow` output doesn't explicitly save `lesson_id` in `final_data`.
+        # We should update `export_final_results` to include `lesson_id`.
+        
+        # Fallback logic: Look for lesson created by this user recently or reuse existing if passed?
+        # Better: Add `lesson_id` to `full_data` in Step 1.
+        
+        # Assuming we can fix that later. For now, use a placeholder or lookup.
+        # Look up most recent lesson by user?
+        last_lesson = db.query(Lesson).filter(Lesson.uploaded_by_id == current_user.id).order_by(Lesson.created_at.desc()).first()
+        if not last_lesson:
+             raise HTTPException(status_code=400, detail="No lesson found for user")
+        lesson_id = last_lesson.id
+
+        # Insert DB Record
+        group_profile = target_pack.get("group", {})
+        pack_plan = target_pack.get("pack_plan", {})
+        
+        # Re-construct output_path for compatibility
+        output_file_name = full_data.get("output_file")
+        output_path = Path("outputs") / output_file_name if output_file_name else None
+        output_path_str = str(output_path) if output_path else ""
+        
+        teaching_pack = create_teaching_pack(
+            db=db,
+            title=f"Teaching Pack for {group_profile.get('group_name', 'Group')}",
+            classroom_id=None, # Or pass from frontend if needed
+            lesson_id=lesson_id,
+            created_by_id=current_user.id,
+            group_configuration={
+                "group_name": group_profile.get("group_name"),
+                "group_profile": group_profile,
+                "pack_plan": pack_plan
+            },
+            output_file_path=output_path_str
+        )
+        
+        # Update JSON in DB (WorkflowJob) - CRITICAL for future steps using this job data
+        if job_record:
+            full_data["teaching_packs"][target_index]["teaching_pack_id"] = teaching_pack.id
+            full_data["teaching_packs"][target_index]["status"] = "processing"
+            
+            job_record.result_json = full_data
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(job_record, "result_json")
+            db.commit()
+            
+        # Update JSON file with new ID (Legacy support - Try but ignore errors)
+        if output_path and output_path.exists():
+            try:
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(full_data, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"Could not update legacy output file: {e}")
+            
+        return {"teaching_pack_id": teaching_pack.id, "status": "committed"}
+
+    except Exception as e:
+        logger.error(f"Commit failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/teaching-packs/{teaching_pack_id}/draft-content")
+async def draft_pack_content(
+    teaching_pack_id: int,
+    request: GenerateDraftRequest,
+    current_user = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    """
+    Draft content for slides or video using AI usage agents on demand.
+    """
+    from models.database_models import TeachingPack
+    
+    # Verify ownership
+    pack = db.query(TeachingPack).filter(TeachingPack.id == teaching_pack_id).first()
+    if not pack or pack.created_by_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Teaching pack not found")
+
+    # Load pack data from output file to get context
+    output_file_path = pack.output_file_path
+    if not output_file_path or not os.path.exists(output_file_path):
+        raise HTTPException(status_code=404, detail="Teaching pack data file not found")
+        
+    try:
+        with open(output_file_path, 'r', encoding='utf-8') as f:
+            full_data = json.load(f)
+            
+        # Find specific pack data
+        target_pack = None
+        for p in full_data.get("teaching_packs", []):
+            if p.get("teaching_pack_id") == teaching_pack_id:
+                target_pack = p
+                break
+        
+        if not target_pack:
+            raise HTTPException(status_code=404, detail="Pack data not found in file")
+            
+        # Extract context
+        group_profile = target_pack.get("group", {})
+        pack_plan = target_pack.get("pack_plan", {})
+        
+        # Run Agent
+        result_data = None
+        if request.type == 'slides':
+            logger.info(f"Drafting slides on demand for pack {teaching_pack_id}...")
+            agent_result = await slide_drafter_agent.run(json.dumps(pack_plan))
+            result_data = agent_result.output.model_dump() # type: ignore
+            # Update local data
+            target_pack["slides"] = result_data
+            
+        elif request.type == 'video':
+            logger.info(f"Drafting video on demand for pack {teaching_pack_id}...")
+            agent_result = await video_drafter_agent.run(json.dumps(pack_plan))
+            result_data = agent_result.output.model_dump() if hasattr(agent_result.output, 'model_dump') else agent_result.output # type: ignore
+            if isinstance(result_data, dict):
+                 pass
+            else:
+                 # Fallback
+                 result_data = {"title": "Draft Video", "script": "Content unavailable", "visual_description": ""}
+            target_pack["video"] = result_data
+
+        else:
+            raise HTTPException(status_code=400, detail="Invalid draft type")
+
+        # Save back to file
+        with open(output_file_path, 'w', encoding='utf-8') as f:
+            json.dump(full_data, f, indent=2, ensure_ascii=False)
+            
+        return result_data
+
+    except Exception as e:
+        logger.error(f"Drafting failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/teaching-packs/{teaching_pack_id}/generate-assets")
+async def generate_pack_assets_endpoint(
+    teaching_pack_id: int,
+    request: GenerateAssetsRequest,
+    background_tasks: BackgroundTasks,
+    current_user = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    """
+    Generate actual assets (Slides, Video) for a teaching pack from refined content.
+    """
+    from models.database_models import TeachingPack
+    # Verify ownership
+    pack = db.query(TeachingPack).filter(TeachingPack.id == teaching_pack_id).first()
+    if not pack or pack.created_by_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Teaching pack not found")
+        
+    job_id = f"assets_{uuid.uuid4()}"
+    jobs_storage[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "message": "Asset generation queued",
+        "result": None,
+        "error": None
+    }
+    
+    background_tasks.add_task(
+        process_asset_generation,
+        job_id,
+        teaching_pack_id,
+        request.slides_content,
+        request.video_content,
+        request.generate_video,
+        request.generate_slides
+    )
+    
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "message": "Asset generation started"
+    }
+
+
+# ============= HELPER FUNCTIONS =============
+async def save_upload_file(upload_file: UploadFile, destination: Path) -> Path:
+    """Save uploaded file to destination"""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as f:
+        content = await upload_file.read()
+        f.write(content)
+    return destination
+
+
+async def process_full_workflow(
+    lesson_file_path: str,
+    num_groups: int,
+    num_students: int,
+    job_id: str,
+    user_id: int,
+    classroom_id: int,
+    student_list_file_path: Optional[str] = None
+):
+    """Process the full teaching pack generation workflow with error recovery"""
+    from models.database import SessionLocal
+    
+    # Ensure file paths use forward slashes to avoid escape character issues with LLM
+    if lesson_file_path:
+        lesson_file_path = Path(lesson_file_path).as_posix()
+    if student_list_file_path:
+        student_list_file_path = Path(student_list_file_path).as_posix()
+    
+    results = {
+        "lesson_summary": None,
+        "skill_set": None,
+        "diagnostic": None,
+        "groups": [],
+        "teaching_packs": [],
+        "errors": []
+    }
+    
+    db = SessionLocal()
+    try:
+        jobs_storage[job_id]["status"] = "processing"
+        
+        # Load student list from classroom, file, or generate mock students
+        if classroom_id:
+            # Check if classroom has students
+            existing_students = get_students_by_classroom(db, classroom_id)
+            if existing_students:
+                logger.info(f"Using {len(existing_students)} existing students from classroom {classroom_id}")
+                student_list = []
+                for student in existing_students:
+                    student_list.append({
+                        "student_id": student.student_id,
+                        "full_name": student.full_name,
+                        "email": student.email,
+                        "subject_scores": student.subject_scores or {},
+                        "grade_level": student.grade_level,
+                        "notes": student.notes,
+                        "group_id": student.group_id
+                    })
+            elif student_list_file_path:
+                logger.info(f"Loading student list from file: {student_list_file_path}")
+                student_list = load_student_list(student_list_file_path, default_count=num_students)
+                logger.info(f"Loaded {len(student_list)} students from uploaded file")
+            else:
+                student_list = load_student_list(None, default_count=num_students)
+                logger.info(f"Generated {len(student_list)} mock students")
+        else:
+            # Fallback for cases without classroom_id
+            if student_list_file_path:
+                logger.info(f"Loading student list from file: {student_list_file_path}")
+                student_list = load_student_list(student_list_file_path, default_count=num_students)
+                logger.info(f"Loaded {len(student_list)} students from uploaded file")
+            else:
+                student_list = load_student_list(None, default_count=num_students)
+                logger.info(f"Generated {len(student_list)} mock students")
+        
+        # Stage 1: Parse lesson
+        try:
+            logger.info("Parsing lesson content...")
+            result = await lesson_parser_agent.run(lesson_file_path)
+            lesson_summary: LessonSummary = result.output # type: ignore
+            results["lesson_summary"] = lesson_summary
+            logger.info(f"Lesson parsed: {lesson_summary.title}")
+            
+            # Create lesson record in database
+            lesson_record = create_lesson(
+                db=db,
+                title=lesson_summary.title,
+                subject=lesson_summary.subject or "General",
+                grade=lesson_summary.grade or "General",
+                classroom_id=None,  # type: ignore # Will be set later if needed
+                uploaded_by_id=user_id,
+                original_filename=Path(lesson_file_path).name,
+                file_path=lesson_file_path,
+                parsed_content=lesson_summary.model_dump()
+            )
+            lesson_id = lesson_record.id
+            logger.info(f"Lesson saved to database with ID: {lesson_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to parse lesson: {str(e)}")
+            results["errors"].append(f"Lesson parsing failed: {str(e)}")
+            raise  # Cannot continue without lesson summary
+        
+        # Stage 2: Map skills
+        try:
+            logger.info("Mapping skills...")
+            result = await skill_mapper_agent.run(lesson_summary.model_dump_json())
+            skill_set: SkillSet = result.output# type: ignore
+            results["skill_set"] = skill_set
+            logger.info(f"Mapped {len(skill_set.skills)} skills")
+        except Exception as e:
+            logger.error(f"Failed to map skills: {str(e)}")
+            results["errors"].append(f"Skill mapping failed: {str(e)}")
+            raise  # Cannot continue without skills
+        
+        # Stage 3: Build diagnostic
+        try:
+            logger.info("Building diagnostic...")
+            result = await diagnostic_builder_agent.run(skill_set.model_dump_json())
+            diagnostic: Diagnostic = result.output# type: ignore
+            results["diagnostic"] = diagnostic
+            logger.info(f"Diagnostic built with {len(diagnostic.questions)} questions")
+        except Exception as e:
+            logger.error(f"Failed to build diagnostic: {str(e)}")
+            results["errors"].append(f"Diagnostic building failed: {str(e)}")
+            raise  # Cannot continue without diagnostic
+        
+        # Stage 4: Generate diagnostic results or use existing groups
+        try:
+            # Check if classroom has existing groups
+            classroom = get_classroom_by_id(db, classroom_id)
+            if classroom and classroom.groups_configuration:  # type: ignore
+                logger.info(f"Using existing groups from classroom {classroom_id}")
+                # Convert existing groups to GroupProfile format
+                labeled_groups = []
+                for group_id, group_data in classroom.groups_configuration.items():
+                    # Map existing group data to GroupProfile
+                    mastery_mapping = {
+                        "foundation": "low",
+                        "medium": "medium", 
+                        "high": "high",
+                        "advanced": "advanced"
+                    }
+                    
+                    group_profile = GroupProfile(
+                        group_id=group_id,
+                        group_name=f"Group {group_id.split('_')[1]}",
+                        description=group_data.get("characteristics", ""),
+                        mastery_level=mastery_mapping.get(group_data.get("level", "medium"), "medium"),  # type: ignore
+                        skill_mastery={},  # Will be filled later if needed
+                        common_misconceptions=[],  # Not available
+                        learning_pace="moderate",  # Default
+                        students=group_data.get("students", []),
+                        recommended_activities=[group_data.get("recommended_exercises", "")]
+                    )
+                    labeled_groups.append(group_profile)
+                logger.info(f"Using {len(labeled_groups)} existing groups")
+                
+                # Skip diagnostic results generation since we have groups
+                diagnostic_results = []
+            else:
+                # Generate mock diagnostic results
+                diagnostic_results = generate_mock_diagnostic_results(student_list, diagnostic, skill_set)
+                logger.info(f"Mock results generated for {len(diagnostic_results)} students")
+                
+                # Stage 5: Profile groups
+                grouping_result = profile_groups_by_quartile(skill_set, diagnostic_results, num_groups)
+                
+                # Stage 6: Label groups
+                labeled_groups = []
+                for group in grouping_result.groups:
+                    logger.info(f"Labeling group {group.group_id}...")
+                    context = {"group": group.model_dump(), "skill_set": skill_set.model_dump()}
+                    result = await group_labeler_agent.run(str(context))
+                    labeled_group: GroupProfile = result.output# type: ignore
+                    labeled_groups.append(labeled_group)
+                    logger.info(f"Group labeled: {labeled_group.group_name}")
+        except Exception as e:
+            logger.error(f"Failed to process groups: {str(e)}")
+            results["errors"].append(f"Group processing failed: {str(e)}")
+            raise
+        
+        results["groups"] = labeled_groups
+        
+        # Stage 7: Generate teaching packs (with error recovery for each pack)
+        teaching_packs = []
+        for group in labeled_groups:
+            pack_data = {
+                "group": group.model_dump(),
+                "pack_plan": None,
+                "slides": None,
+                "video": None,
+                "errors": []
+            }
+            
+            try:
+                # Plan pack
+                logger.info(f"Planning pack for {group.group_name}...")
+                context = {
+                    "group": group.model_dump(),
+                    "lesson_summary": lesson_summary.model_dump(),
+                    "skill_set": skill_set.model_dump()
+                }
+                result = await pack_planner_agent.run(str(context))
+                pack_plan: PackPlan = result.output# type: ignore
+                pack_data["pack_plan"] = pack_plan.model_dump()
+                logger.info(f"Pack planned with {len(pack_plan.slide_outline)} slides")
+                
+                # Generate quiz and practice questions
+                try:
+                    logger.info(f"Generating quiz for {group.group_name}...")
+                    result = await quiz_practice_agent.run(pack_plan.model_dump_json())
+                    quiz_data = result.output# type: ignore
+                    pack_data["quiz"] = quiz_data.model_dump() if hasattr(quiz_data, 'model_dump') else quiz_data  # type: ignore
+                    logger.info(f"Quiz generated with {len(quiz_data.questions) if hasattr(quiz_data, 'questions') else 'unknown'} questions")  # type: ignore
+                except Exception as e:
+                    logger.error(f"Failed to generate quiz for {group.group_name}: {str(e)}")
+                    pack_data["errors"].append(f"Quiz generation failed: {str(e)}")
+                    pack_data["quiz"] = {"questions": [], "practice_exercises": [], "answer_key": []}
+                
+                # Generate slides using AI agent
+                # COMMENTED OUT FOR TESTING - Slides generation takes too long
+                # Draft slides using AI agent (No generation yet)
+                # MODIFIED: Skip automatic drafting to speed up generation. Use pack plan outline.
+                try:
+                    logger.info(f"Initializing slides structure for {group.group_name}...")
+                    # result = await slide_drafter_agent.run(pack_plan.model_dump_json())
+                    # slides: Slides = result.output
+                    # pack_data["slides"] = slides.model_dump()
+                    
+                    # Use lightweight initialization based on pack plan
+                    pack_data["slides"] = {
+                        "slides": [
+                            {"slide_id": f"slide_{i+1}", "title": outline.get("title", f"Slide {i+1}"), 
+                             "content": outline.get("content", "")}
+                            for i, outline in enumerate(pack_plan.slide_outline)
+                        ],
+                        "generated_url": None
+                    }
+                    pack_data["slides_url"] = None
+                    logger.info(f"Slides structure initialized with {len(pack_plan.slide_outline)} slides")
+                except Exception as e:
+                    logger.error(f"Failed to draft slides for {group.group_name}: {str(e)}")
+                    pack_data["errors"].append(f"Slides drafting failed: {str(e)}")
+                    # Fallback to mock slides
+                    pack_title = getattr(pack_plan, 'title', None) or f"Teaching Pack for {group.group_name}"
+                    pack_data["slides"] = {
+                        "slides": [
+                            {"slide_id": f"slide_{i+1}", "title": outline.get("title", f"Slide {i+1}"), 
+                             "content": outline.get("content", "")}
+                            for i, outline in enumerate(pack_plan.slide_outline)
+                        ],
+                        "generated_url": None
+                    }
+                    pack_data["slides_url"] = None
+                """
+
+                # Fallback slides
+                pack_data["slides"] = {
+                    "slides": [
+                        {"slide_id": f"slide_{i+1}", "title": outline.get("title", f"Slide {i+1}"), 
+                         "content": outline.get("content", "")}
+                        for i, outline in enumerate(pack_plan.slide_outline)
+                    ],
+                    "generated_url": None
+                }
+                pack_data["slides_url"] = None
+
+                # Draft video using AI agent (No generation yet)
+                # MODIFIED: Skip automatic drafting.
+
+                # Fallback video
+                pack_data["video"] = {"title": "Video unavailable", "script": "Video script not available", "visual_description": "Visual description not available", "url": "", "thumbnail": ""}
+                pack_data["video_url"] = None
+                pack_data["video_thumbnail"] = None
+
+                
+                # Create teaching pack record in database
+                # MODIFIED: Skip DB insertion for "Preview" stage.
+                # Just add local placeholder ID (null) to indicate it's not committed.
+                pack_data["teaching_pack_id"] = None
+                pack_data["status"] = "preview"
+                logger.info(f"Teaching Pack prepared for preview (No DB insert yet): {group.group_name}")
+                
+                teaching_packs.append(pack_data)
+                
+            except Exception as e:
+                logger.error(f"Failed to generate pack for {group.group_name}: {str(e)}")
+                pack_data["errors"].append(f"Pack generation failed: {str(e)}")
+                results["errors"].append(f"Pack for {group.group_name} failed: {str(e)}")
+                
+                pack_data["teaching_pack_id"] = None
+                pack_data["status"] = "failed"
+
+                
+                # Add partial pack data
+                teaching_packs.append(pack_data)
+        
+        results["teaching_packs"] = teaching_packs
+        
+        # Save results to database instead of JSON file
+        try:
+            lesson_summary_data = lesson_summary.model_dump() if lesson_summary else None
+            skill_set_data = skill_set.model_dump() if skill_set else None
+            diagnostic_data = diagnostic.model_dump() if diagnostic else None
+            groups_data = [g.model_dump() for g in labeled_groups] if labeled_groups else []
+            
+            # Update each teaching pack record with the data
+            for pack_data in teaching_packs:
+                if "teaching_pack_id" in pack_data:
+                    teaching_pack = db.query(TeachingPack).filter(TeachingPack.id == pack_data["teaching_pack_id"]).first()
+                    if teaching_pack:
+                        # Only save the pack_data, which contains all info
+                        teaching_pack.teaching_pack_data = pack_data  # type: ignore
+                        db.commit()
+            
+            results["saved_to_db"] = True
+            
+        except Exception as e:
+            logger.error(f"Failed to save results to database: {str(e)}")
+            results["errors"].append(f"Database save failed: {str(e)}")
+            db.rollback()
+        
+        # Update teaching pack statuses
+        # SKIPPED: No DB records to update in preview mode
+        # try:
+        #     for pack_data in teaching_packs:
+        #         if "teaching_pack_id" in pack_data:
+        #             status = "failed" if pack_data.get("errors") else "completed"
+        #             update_teaching_pack_status(db, pack_data["teaching_pack_id"], status)
+        #     db.commit()
+        #     logger.info("Teaching pack statuses updated in database")
+        # except Exception as db_e:
+        #     logger.error(f"Failed to update teaching pack statuses: {str(db_e)}")
+        
+        # Update job status
+        if len(results["errors"]) == 0:
+            jobs_storage[job_id]["status"] = "completed"
+            jobs_storage[job_id]["message"] = f"Successfully generated {len(teaching_packs)} teaching packs"
+        else:
+            jobs_storage[job_id]["status"] = "completed_with_errors"
+            jobs_storage[job_id]["message"] = f"Generated {len(teaching_packs)} teaching packs with {len(results['errors'])} errors"
+        
+        final_result_dict = {
+            "lesson_summary": results["lesson_summary"].model_dump() if results["lesson_summary"] else None,
+            "skill_set": results["skill_set"].model_dump() if results["skill_set"] else None,
+            "diagnostic": results["diagnostic"].model_dump() if results["diagnostic"] else None,
+            "groups": [g.model_dump() for g in results["groups"]],
+            "teaching_packs": results["teaching_packs"],
+            "output_file": results.get("output_file"),
+            "errors": results["errors"]
+        }
+        
+        jobs_storage[job_id]["result"] = final_result_dict
+        
+        # Save to DB (WorkflowJob)
+        try:
+            from models.database_models import WorkflowJob
+            job_record = db.query(WorkflowJob).filter(WorkflowJob.id == job_id).first()
+            if not job_record:
+                job_record = WorkflowJob(id=job_id, status=jobs_storage[job_id]["status"], result_json=final_result_dict)
+                db.add(job_record)
+            else:
+                job_record.status = jobs_storage[job_id]["status"]
+                job_record.result_json = final_result_dict
+                job_record.message = jobs_storage[job_id].get("message")
+            db.commit()
+            logger.info(f"Saved WorkflowJob {job_id} to database")
+        except Exception as db_e:
+            logger.error(f"Failed to save WorkflowJob to DB: {db_e}")
+        
+        logger.info(f"Job {job_id} completed with {len(results['errors'])} errors")
+        
+    except Exception as e:
+        logger.error(f"Job {job_id} failed critically: {str(e)}")
+        jobs_storage[job_id]["status"] = "failed"
+        jobs_storage[job_id]["error"] = str(e)
+        
+        failed_result_dict = {
+            "lesson_summary": results["lesson_summary"].model_dump() if results["lesson_summary"] else None,
+            "skill_set": results["skill_set"].model_dump() if results["skill_set"] else None,
+            "diagnostic": results["diagnostic"].model_dump() if results["diagnostic"] else None,
+            "groups": [g.model_dump() for g in results["groups"]],
+            "teaching_packs": results["teaching_packs"],
+            "errors": results["errors"] + [str(e)]
+        }
+        
+        jobs_storage[job_id]["partial_result"] = failed_result_dict
+        
+        # Save failure to DB
+        try:
+            from models.database_models import WorkflowJob
+            job_record = db.query(WorkflowJob).filter(WorkflowJob.id == job_id).first()
+            if not job_record:
+                job_record = WorkflowJob(id=job_id, status="failed", message=str(e), result_json=failed_result_dict)
+                db.add(job_record)
+            else:
+                job_record.status = "failed"
+                job_record.message = str(e)
+                job_record.result_json = failed_result_dict
+            db.commit()
+        except Exception as db_e:
+            logger.error(f"Failed to save failed WorkflowJob to DB: {db_e}")
+
+    finally:
+        db.close()
+
+
+async def process_asset_generation(
+    job_id: str,
+    teaching_pack_id: int,
+    slides_content: Optional[Dict],
+    video_content: Optional[Dict],
+    generate_video: bool,
+    generate_slides: bool = True
+):
+    """
+    Process asset generation (Slides and optional Video) for a teaching pack.
+    """
+    from models.database import SessionLocal
+    from models.database_models import TeachingPack
+    from models.database_service import get_db, update_teaching_pack_status
+    
+    db = SessionLocal()
+    try:
+        jobs_storage[job_id]["status"] = "processing"
+        
+        # Get Teaching Pack
+        teaching_pack = db.query(TeachingPack).filter(TeachingPack.id == teaching_pack_id).first()
+        if not teaching_pack:
+            raise ValueError(f"Teaching pack {teaching_pack_id} not found")
+        
+        # Get Teaching Pack data from database
+        if teaching_pack.teaching_pack_data is None:
+            raise ValueError(f"Teaching pack data not found for teaching pack {teaching_pack_id}")
+        
+        target_pack = teaching_pack.teaching_pack_data
+
+        # 1. Generate Slides
+        if generate_slides and slides_content:
+            try:
+                logger.info("Generating slides...")
+                # Convert slides content to text for the tool
+                # Assuming slides_content is the Slides object dict
+                slides_text = ""
+                for slide in slides_content.get("slides", []):
+                    slides_text += f"# {slide.get('title', '')}\n{slide.get('content', '')}\n\n"
+                
+                # Extract theme_id from teacher notes or use default (TODO: Pass theme_id in request)
+                # Default theme
+                theme_id = "default" 
+                
+                # Use generate_slides_from_text directly
+                # Note: This tool might expect specific format.
+                slide_result = generate_slides_from_text(slides_text, theme_id=theme_id)
+                
+                # Check for downloadUrl in the response data
+                download_url = slide_result.get('data', {}).get('downloadUrl') or slide_result.get('downloadUrl')
+                if download_url:
+                    # Download the file and save it locally
+                    try:
+                        response = requests.get(download_url)
+                        response.raise_for_status()
+                        
+                        # Generate unique filename
+                        slides_filename = f"generated_slides_{uuid.uuid4().hex[:8]}.pptx"
+                        slides_path = OUTPUT_DIR / slides_filename
+                        
+                        # Save the file
+                        with open(slides_path, 'wb') as f:
+                            f.write(response.content)
+                        
+                        # Convert PPTX to images for preview
+                        try:
+                            from pptx import Presentation
+                            from PIL import Image
+                            import io
+                            
+                            # Load the presentation
+                            presentation = Presentation(str(slides_path))
+                            
+                            # Create images directory
+                            images_dir = OUTPUT_DIR / f"{slides_filename}_images"
+                            images_dir.mkdir(exist_ok=True)
+                            
+                            # Convert each slide to image
+                            slide_images = []
+                            for i, slide in enumerate(presentation.slides):
+                                # For now, just create a simple placeholder - full conversion would need more complex setup
+                                # We'll implement a simpler approach
+                                pass
+                            
+                            # For now, just serve the PPTX directly with better headers
+                            
+                        except Exception as img_error:
+                            logger.warning(f"Could not convert slides to images: {img_error}")
+                        
+                        # Set local URL
+                        local_url = f"http://localhost:8000/api/slides/{slides_filename}"
+                        target_pack["slides_url"] = local_url  # type: ignore
+                        
+                        # Update the slides object too
+                        if "slides" in target_pack:
+                            target_pack["slides"]["generated_url"] = local_url  # type: ignore
+                        
+                        logger.info(f"Slides generated and saved: {local_url}")
+                    except Exception as download_error:
+                        logger.error(f"Failed to download slides: {download_error}")
+                        # Fallback to remote URL
+                        target_pack["slides_url"] = download_url
+                        if "slides" in target_pack:
+                            target_pack["slides"]["generated_url"] = download_url
+                        logger.info(f"Slides generated (remote): {download_url}")
+                else:
+                    logger.error(f"Slide generation returned no URL: {slide_result}")
+            except Exception as e:
+                logger.error(f"Failed to generate slides: {e}")
+                target_pack["errors"] = target_pack.get("errors", []) + [f"Slide generation failed: {str(e)}"]  # type: ignore
+
+        # 2. Generate Video (if requested)
+        if generate_video and video_content:
+            try:
+                logger.info("Generating video...")
+                script = video_content.get("script", "")
+                visuals = video_content.get("visual_description", "")
+                prompt = f"Create a video with this script: {script}\n\nVisuals: {visuals}"
+                
+                video_result = generate_video_from_prompt(prompt, duration_seconds=30)
+                
+                if video_result.get("success"):
+                     target_pack["video_url"] = video_result.get("video_url")  # type: ignore
+                     target_pack["video_thumbnail"] = video_result.get("thumbnail_url")  # type: ignore
+                     if "video" in target_pack:
+                         target_pack["video"]["generated_url"] = video_result.get("video_url")  # type: ignore
+                         target_pack["video"]["thumbnail_url"] = video_result.get("thumbnail_url")  # type: ignore
+                     logger.info(f"Video generated: {video_result.get('video_url')}")
+                else:
+                    logger.error(f"Video generation failed: {video_result.get('error')}")
+            except Exception as e:
+                logger.error(f"Failed to generate video: {e}")
+                target_pack["errors"] = target_pack.get("errors", []) + [f"Video generation failed: {str(e)}"]  # type: ignore
+
+        # Save updated data to database
+        teaching_pack.teaching_pack_data = target_pack  # type: ignore
+        # Force SQLAlchemy to detect the change in JSON field
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(teaching_pack, "teaching_pack_data")
+        db.commit()
+        db.refresh(teaching_pack)
+        logger.info(f"Teaching pack {teaching_pack_id} updated with slides_url: {target_pack.get('slides_url')}")
+        logger.info(f"Teaching pack {teaching_pack_id} updated with video_url: {target_pack.get('video_url')}")
+            
+        # Update DB status
+        update_teaching_pack_status(db, teaching_pack_id, "completed")
+        
+        jobs_storage[job_id]["status"] = "completed"
+        jobs_storage[job_id]["result"] = target_pack
+        
+    except Exception as e:
+        logger.error(f"Asset generation failed: {e}")
+        jobs_storage[job_id]["status"] = "failed"
+        jobs_storage[job_id]["error"] = str(e)
+    finally:
+        db.close()
+
+
+# ============= API ENDPOINTS =============
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Teaching Pack Generator API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "endpoints": {
+            "auth": {
+                "login": "POST /api/auth/login",
+                "register": "POST /api/auth/register"
+            },
+            "classrooms": {
+                "list": "GET /api/classrooms",
+                "create": "POST /api/classrooms",
+                "update": "PUT /api/classrooms/{classroom_id}",
+                "delete": "DELETE /api/classrooms/{classroom_id}",
+                "students": "GET /api/classrooms/{classroom_id}/students",
+                "add_student": "POST /api/classrooms/{classroom_id}/students",
+                "lessons": "GET /api/classrooms/{classroom_id}/lessons",
+                "teaching_packs": "GET /api/classrooms/{classroom_id}/teaching-packs"
+            },
+            "students": {
+                "update": "PUT /api/students/{student_id}",
+                "delete": "DELETE /api/students/{student_id}"
+            },
+            "lessons": "GET /api/lessons",
+            "teaching_packs": "GET /api/teaching-packs",
+            "lesson_parse": "POST /api/lesson/parse",
+            "skills_map": "POST /api/skills/map",
+            "diagnostic_build": "POST /api/diagnostic/build",
+            "packs_generate": "POST /api/packs/generate",
+            "job_status": "GET /api/jobs/{job_id}"
+        }
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "gemini_api_configured": bool(os.getenv("GEMINI_API_KEY"))
+    }
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+async def read_users_me(current_user = Depends(get_current_active_user)):
+    """Get current user information"""
+    return UserResponse(
+        id=current_user.id,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        role=current_user.role.value,
+        is_active=current_user.is_active
+    )
+
+
+@app.post("/api/lesson/parse")
+async def parse_lesson(
+    file: UploadFile = File(...),
+    classroom_id: Optional[int] = None,
+    current_user: User = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    """
+    Parse a lesson file (PDF or TXT) to extract lesson summary
+
+    - **file**: Lesson file (PDF or TXT format)
+    - **classroom_id**: Optional classroom ID to associate the lesson with
+
+    Returns: LessonSummary with title, subject, grade, key concepts, etc.
+    """
+    try:
+        # Validate file type
+        if not file.filename.endswith(('.pdf', '.txt')):# type: ignore
+            raise HTTPException(status_code=400, detail="Only PDF and TXT files are supported")
+
+        # Save uploaded file
+        job_id = str(uuid.uuid4())
+        upload_dir = OUTPUT_DIR / "uploads" / job_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        file_path = upload_dir / file.filename# type: ignore
+
+        await save_upload_file(file, file_path)
+        logger.info(f"File saved: {file_path}")
+
+        # Parse lesson
+        logger.info("Parsing lesson content...")
+        # Ensure path uses forward slashes
+        result = await lesson_parser_agent.run(Path(file_path).as_posix())
+        lesson_summary: LessonSummary = result.output# type: ignore
+        logger.info(f"Lesson parsed: {lesson_summary.title}")
+
+        # Save lesson to database if classroom_id is provided
+        if classroom_id:
+            lesson = create_lesson(
+                db=db,
+                title=lesson_summary.title,
+                subject=lesson_summary.subject,
+                grade=lesson_summary.grade,
+                classroom_id=classroom_id,
+                uploaded_by_id=current_user.id,  # type: ignore
+                original_filename=file.filename,# type: ignore
+                file_path=str(file_path),
+                file_size=file_path.stat().st_size if file_path.exists() else None,  # type: ignore
+                parsed_content=lesson_summary.dict()
+            )
+            logger.info(f"Lesson saved to database: {lesson.id}")
+
+        return LessonParseResponse(
+            lesson_summary=lesson_summary,
+            job_id=job_id
+        )
+
+    except Exception as e:
+        logger.error(f"Error parsing lesson: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/skills/map")
+async def map_skills(
+    lesson_summary: LessonSummary,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Map skills from a lesson summary
+    
+    - **lesson_summary**: Lesson summary from parse_lesson endpoint
+    
+    Returns: SkillSet with identified skills and dependencies
+    
+    Requires authentication.
+    """
+    try:
+        logger.info("Mapping skills...")
+        result = await skill_mapper_agent.run(lesson_summary.model_dump_json())
+        skill_set: SkillSet = result.output# type: ignore
+        logger.info(f"Mapped {len(skill_set.skills)} skills")
+        
+        job_id = str(uuid.uuid4())
+        
+        return SkillMapResponse(
+            skill_set=skill_set,
+            job_id=job_id
+        )
+        
+    except Exception as e:
+        logger.error(f"Error mapping skills: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/diagnostic/build")
+async def build_diagnostic(
+    skill_set: SkillSet,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Build a diagnostic assessment from a skill set
+    
+    - **skill_set**: Skill set from map_skills endpoint
+    
+    Returns: Diagnostic with questions to assess each skill
+    
+    Requires authentication.
+    """
+    try:
+        logger.info("Building diagnostic...")
+        result = await diagnostic_builder_agent.run(skill_set.model_dump_json())
+        diagnostic: Diagnostic = result.output# type: ignore
+        logger.info(f"Diagnostic built with {len(diagnostic.questions)} questions")
+        
+        job_id = str(uuid.uuid4())
+        
+        return DiagnosticResponse(
+            diagnostic=diagnostic,
+            job_id=job_id
+        )
+        
+    except Exception as e:
+        logger.error(f"Error building diagnostic: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/packs/generate")
+async def generate_teaching_packs(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    classroom_id: int = Form(...),
+    num_groups: int = 4,
+    num_students: int = 30,
+    student_list_file: Optional[UploadFile] = File(None),
+    current_user: User = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    """
+    Generate complete teaching packs from a lesson file (Full workflow)
+    
+    - **file**: Lesson file (PDF or TXT format)
+    - **classroom_id**: ID of the classroom to associate the teaching packs with
+    - **num_groups**: Number of student groups (default: 4)
+    - **num_students**: Number of mock students if no student list file provided (default: 30)
+    - **student_list_file**: Optional student list file (Excel, CSV, TXT, JSON)
+    
+    Returns: Job ID to track processing status
+    
+    This endpoint runs the complete workflow:
+    1. Parse lesson
+    2. Map skills
+    3. Build diagnostic
+    4. Generate diagnostic results (using real student list if provided)
+    5. Group students by performance
+    6. Label groups
+    7. Generate differentiated teaching packs (slides, videos)
+    
+    Requires authentication.
+    """
+    try:
+        # Validate file type
+        if not file.filename.endswith(('.pdf', '.txt')):# type: ignore
+            raise HTTPException(status_code=400, detail="Only PDF and TXT files are supported")
+        
+        # Save uploaded lesson file
+        job_id = str(uuid.uuid4())
+        upload_dir = OUTPUT_DIR / "uploads" / job_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        file_path = upload_dir / file.filename# type: ignore
+        
+        await save_upload_file(file, file_path)
+        logger.info(f"Lesson file saved: {file_path}")
+        
+        # Save student list file if provided
+        student_list_path = None
+        if student_list_file and student_list_file.filename:
+            student_list_path = upload_dir / student_list_file.filename# type: ignore
+            await save_upload_file(student_list_file, student_list_path)
+            logger.info(f"Student list file saved: {student_list_path}")
+        
+        # Validate classroom ownership
+        classroom = get_classroom_by_id(db, classroom_id)
+        if not classroom or classroom.teacher_id != current_user.id:  # type: ignore
+            raise HTTPException(status_code=404, detail="Classroom not found")
+        
+        # Initialize job
+        jobs_storage[job_id] = {
+            "job_id": job_id,
+            "status": "pending",
+            "message": "Job queued for processing",
+            "result": None,
+            "error": None
+        }
+        
+        # Add background task
+        background_tasks.add_task(
+            process_full_workflow,
+            str(file_path),
+            num_groups,
+            num_students,
+            job_id,
+            current_user.id,  # type: ignore
+            classroom_id,
+            str(student_list_path) if student_list_path else None
+        )
+        
+        return {
+            "job_id": job_id,
+            "status": "pending",
+            "message": "Teaching pack generation started. Use /api/jobs/{job_id} to check status."
+        }
+        
+    except Exception as e:
+        logger.error(f"Error starting job: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job_status(
+    job_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Get the status of a teaching pack generation job
+    
+    - **job_id**: Job ID from generate_teaching_packs endpoint
+    
+    Returns: Job status (pending, processing, completed, failed)
+    
+    Requires authentication.
+    """
+    if job_id not in jobs_storage:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    job = jobs_storage[job_id]
+    return JobStatus(**job)
+
+
+@app.get("/api/outputs/{filename}")
+async def get_output_file(filename: str):
+    """
+    Download output file
+    
+    - **filename**: Name of the output file
+    """
+    # Strip "outputs/" prefix if present
+    if filename.startswith("outputs/"):
+        filename = filename[len("outputs/"):]
+    
+    file_path = OUTPUT_DIR / filename
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"File {filename} not found")
+    
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="application/json"
+    )
+
+
+@app.get("/api/outputs")
+async def list_outputs():
+    """
+    List all output files
+    """
+    output_files = [f.name for f in OUTPUT_DIR.glob("*.json")]
+    return {
+        "files": output_files,
+        "count": len(output_files)
+    }
+
+
+@app.get("/api/videos/{filename}")
+async def get_video_file(filename: str):
+    """
+    Serve video files
+    
+    - **filename**: Name of the video file
+    """
+    video_path = OUTPUT_DIR / filename
+    
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail=f"Video file {filename} not found")
+    
+    return FileResponse(
+        path=str(video_path),
+        filename=filename,
+        media_type="video/mp4"
+    )
+
+
+@app.get("/api/slides/{filename}")
+async def get_slides_file(filename: str):
+    """
+    Serve slides files
+    
+    - **filename**: Name of the slides file
+    """
+    slides_path = OUTPUT_DIR / filename
+    
+    if not slides_path.exists():
+        raise HTTPException(status_code=404, detail=f"Slides file {filename} not found")
+    
+    # Create response with headers optimized for embedding
+    response = FileResponse(
+        path=str(slides_path),
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )
+    
+    # Add headers to allow embedding and cross-origin access
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Content-Disposition"] = f"inline; filename=\"{filename}\""
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    
+    return response

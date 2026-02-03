@@ -1,0 +1,161 @@
+{
+  "description": "Example ground truth file for evaluation",
+  "usage": "This file demonstrates the format for providing additional ground truth data to the evaluator. All fields are optional - the evaluator will work with just the lesson summary if no ground truth is provided.",
+
+  "expected_content_coverage": {
+    "must_include_concepts": [
+      "DNA structure (double helix)",
+      "Gene definition",
+      "Transcription process",
+      "Translation process",
+      "Genetic code (codons)",
+      "RNA types (mRNA, tRNA, rRNA)"
+    ],
+    "should_include_examples": [
+      "DNA base pairing (A-T, G-C)",
+      "Central dogma (DNA -> RNA -> Protein)",
+      "Real-world genetic traits"
+    ],
+    "may_include_advanced": [
+      "Exceptions to genetic code",
+      "Post-transcriptional modifications",
+      "Epigenetics"
+    ]
+  },
+
+  "pedagogical_requirements": {
+    "target_grade": "9-12",
+    "difficulty_distribution": {
+      "easy": 0.3,
+      "medium": 0.4,
+      "hard": 0.3
+    },
+    "scaffolding_strategy": "Start with concrete DNA structure, build to abstract processes like transcription and translation",
+    "learning_progression": [
+      "1. DNA structure (concrete, visual)",
+      "2. Gene as functional unit",
+      "3. Transcription (DNA to RNA)",
+      "4. Translation (RNA to protein)",
+      "5. Central dogma integration"
+    ],
+    "common_misconceptions_to_address": [
+      "DNA and RNA are not the same thing",
+      "Genes are segments of DNA, not proteins",
+      "Transcription and translation are different processes",
+      "The genetic code is universal (with rare exceptions)"
+    ]
+  },
+
+  "expected_slide_structure": {
+    "min_slides": 6,
+    "max_slides": 10,
+    "suggested_slides": [
+      {
+        "title": "What is DNA?",
+        "key_points": [
+          "Double helix structure",
+          "Made of nucleotides",
+          "Base pairing rules (A-T, G-C)"
+        ],
+        "visual_requirements": "Diagram of DNA double helix"
+      },
+      {
+        "title": "What is a Gene?",
+        "key_points": [
+          "Segment of DNA",
+          "Codes for protein or RNA",
+          "Functional unit of heredity"
+        ]
+      },
+      {
+        "title": "Transcription: DNA to RNA",
+        "key_points": [
+          "RNA polymerase enzyme",
+          "DNA template strand",
+          "mRNA product"
+        ],
+        "visual_requirements": "Diagram showing transcription process"
+      },
+      {
+        "title": "Translation: RNA to Protein",
+        "key_points": [
+          "Ribosomes",
+          "tRNA brings amino acids",
+          "Codons specify amino acids"
+        ],
+        "visual_requirements": "Diagram showing translation at ribosome"
+      }
+    ]
+  },
+
+  "expected_quiz_coverage": {
+    "skills_to_test": [
+      "DNA structure recognition",
+      "Gene definition recall",
+      "Transcription process understanding",
+      "Translation mechanism",
+      "Genetic code application",
+      "RNA types differentiation"
+    ],
+    "question_types": {
+      "multiple_choice": 0.7,
+      "short_answer": 0.3
+    },
+    "bloom_taxonomy_distribution": {
+      "remember": 0.2,
+      "understand": 0.4,
+      "apply": 0.3,
+      "analyze": 0.1
+    }
+  },
+
+  "differentiation_criteria": {
+    "low_mastery_group": {
+      "focus": "Foundational concepts with heavy scaffolding",
+      "vocabulary": "Simple, everyday language",
+      "examples": "Concrete, visual, relatable",
+      "pace": "Slower with repetition"
+    },
+    "medium_mastery_group": {
+      "focus": "Standard coverage with moderate scaffolding",
+      "vocabulary": "Mix of everyday and scientific terms",
+      "examples": "Balance of concrete and abstract",
+      "pace": "Moderate"
+    },
+    "high_mastery_group": {
+      "focus": "Comprehensive coverage with extensions",
+      "vocabulary": "Scientific terminology",
+      "examples": "Abstract, complex, exception cases",
+      "pace": "Faster with challenges"
+    }
+  },
+
+  "quality_indicators": {
+    "accuracy_benchmarks": {
+      "factual_correctness": 0.95,
+      "concept_completeness": 0.90,
+      "definition_precision": 0.95
+    },
+    "pedagogical_benchmarks": {
+      "age_appropriateness": 0.90,
+      "logical_flow": 0.95,
+      "engagement_potential": 0.80,
+      "cognitive_load": 0.85
+    }
+  },
+
+  "evaluation_notes": {
+    "emphasis": "Prioritize factual accuracy and logical progression over stylistic choices",
+    "red_flags": [
+      "Confusing DNA and RNA",
+      "Incorrect genetic code",
+      "Mixing up transcription and translation",
+      "Grade-inappropriate terminology without explanation"
+    ],
+    "bonus_points": [
+      "Clear visual descriptions for complex processes",
+      "Connections to real-world applications",
+      "Addressing common misconceptions proactively"
+    ]
+  }
+}

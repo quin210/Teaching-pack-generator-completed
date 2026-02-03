@@ -1,0 +1,28 @@
+[
+  {
+    "prompt": "<ANONYMIZED_PROMPT_001>",
+    "chosen": "<ANONYMIZED_RESPONSE_POSITIVE>",
+    "rejected": "<ANONYMIZED_RESPONSE_NEGATIVE>",
+    "meta": {
+      "details": {
+        "context": "<ANONYMIZED_CONTEXT>",
+        "grade": "<ANONYMIZED_GRADE>",
+        "value": "<ANONYMIZED_VALUE>"
+      },
+      "additional": "<ANONYMIZED_ADDITIONAL>"
+    }
+  },
+  {
+    "prompt": "<ANONYMIZED_PROMPT_002>",
+    "chosen": "<ANONYMIZED_RESPONSE_POSITIVE>",
+    "rejected": "<ANONYMIZED_RESPONSE_NEGATIVE>",
+    "meta": {
+      "details": {
+        "context": "<ANONYMIZED_CONTEXT>",
+        "grade": "<ANONYMIZED_GRADE>",
+        "value": "<ANONYMIZED_VALUE>"
+      },
+      "additional": "<ANONYMIZED_ADDITIONAL>"
+    }
+  }
+]

@@ -1,0 +1,14 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap');
+
+@layer base {
+  body {
+    font-family: 'Lexend', sans-serif;
+    background-color: theme(colors.stone.50);
+    color: theme(colors.zinc.800);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    line-height: 1.65;
+  }
+}
+
